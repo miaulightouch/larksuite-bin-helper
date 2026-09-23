@@ -1,0 +1,54 @@
+name: Update AUR
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: larksuite-bin-aur-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check updater
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+      - name: Update AUR package
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$AUR_SSH_PRIVATE_KEY"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$work/aur_key"
+          chmod 600 "$work/aur_key"
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$work/known_hosts"
+          fingerprint=$(ssh-keygen -lf "$work/known_hosts" -E sha256 | awk '{print $2}')
+          test "$fingerprint" = 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          export GIT_SSH_COMMAND="ssh -i $work/aur_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$work/known_hosts -o StrictHostKeyChecking=yes"
+
+          git clone ssh://aur@aur.archlinux.org/larksuite-bin.git "$work/aur"
+          python3 update.py "$work/aur/PKGBUILD"
+          if git -C "$work/aur" diff --quiet -- PKGBUILD; then
+            exit 0
+          fi
+
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$work/aur:/pkg" -w /pkg archlinux:base-devel \
+            sh -c 'makepkg --printsrcinfo > .SRCINFO && makepkg --nodeps --force --clean'
+          git -C "$work/aur" diff --check
+          git -C "$work/aur" add PKGBUILD .SRCINFO
+          version=$(sed -n 's/^pkgver=//p' "$work/aur/PKGBUILD")
+          git -C "$work/aur" -c user.name='larksuite-bin-helper' \
+            -c user.email='larksuite-bin-helper@users.noreply.github.com' \
+            commit -m "chore(pkgbuild): update lark sources for $version"
+          git -C "$work/aur" push origin HEAD:master
